@@ -486,9 +486,12 @@ mod tests {
         GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
         GET_USER_CODE, GET_USERS_CODE,
     };
-    use iggy_binary_protocol::requests::topics::UpdateTopicRequest;
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest, UpdateTopicRequest,
+    };
     use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions};
-    use iggy_common::wire_conversions::resource_options_from_wire;
     use iggy_common::{Durability, IggyTimestamp, TopicCreateOptions};
     use metadata::AppliedFrontier;
     use metadata::stm::StateHandler;
@@ -503,47 +506,69 @@ mod tests {
     #[test]
     fn named_produce_attests_the_dispatched_topic() {
         let mut inner = metadata::stm::stream::StreamsInner::default();
-        let mut stream = metadata::stm::stream::Stream::default();
-        let [(original_id, original_revision), (replacement_id, _)] = [
-            ("orders", Durability::Persisted, 3),
-            ("fast", Durability::Replicated, 4),
-        ]
-        .map(|(name, policy, revision)| {
-            let options = TopicCreateOptions {
-                durability: policy,
-                ..Default::default()
+
+        // Creation establishes the IDs, revisions, and name indexes together.
+        let result = CreateStreamRequest {
+            name: WireName::new("events").unwrap(),
+            options: WireOptions::empty(),
+        }
+        .apply(&mut inner, IggyTimestamp::default());
+        assert_eq!(result.code, 0, "stream creation must succeed");
+        let stream_identifier = WireIdentifier::String(WireName::new("events").unwrap());
+        let stream_id = crate::responses::resolve_stream_id(&inner, &stream_identifier).unwrap();
+
+        for (name, policy, consensus_group_id) in [
+            ("orders", Durability::Persisted, 1),
+            ("fast", Durability::Replicated, 2),
+        ] {
+            let result = CreateTopicWithAssignmentsRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::Numeric(stream_id.try_into().unwrap()),
+                    partitions_count: 1,
+                    name: WireName::new(name).unwrap(),
+                    options: TopicCreateOptions {
+                        durability: policy,
+                        ..Default::default()
+                    }
+                    .to_wire()
+                    .unwrap(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id,
+                }],
+                created_view: 0,
             }
-            .to_wire()
-            .unwrap();
-            let topic = metadata::stm::stream::Topic {
-                name: name.into(),
-                options: resource_options_from_wire(&options, true).unwrap(),
-                partitions: vec![metadata::stm::stream::Partition::new(
-                    0,
-                    1,
-                    IggyTimestamp::default(),
-                    revision,
-                    0,
-                )],
-                ..Default::default()
-            };
-            let topic_id = stream.topics.insert(topic);
-            stream.topic_index.insert(name.into(), topic_id);
-            (topic_id, revision)
-        });
-        let stream_id = inner.items.insert(stream);
+            .apply(&mut inner, IggyTimestamp::default());
+            assert_eq!(result.code, 0, "topic creation must succeed");
+        }
+
         let requested_topic = WireIdentifier::String(WireName::new("orders").unwrap());
-        assert_eq!(
-            crate::responses::resolve_topic_id(&inner, stream_id, &requested_topic).unwrap(),
-            original_id
-        );
+        let original_id =
+            crate::responses::resolve_topic_id(&inner, stream_id, &requested_topic).unwrap();
+        let replacement_identifier = WireIdentifier::String(WireName::new("fast").unwrap());
+        let replacement_id =
+            crate::responses::resolve_topic_id(&inner, stream_id, &replacement_identifier).unwrap();
+
+        // Model the policy captured before the HTTP request can wait for dispatch.
+        let original_topic = inner
+            .items
+            .get(stream_id)
+            .unwrap()
+            .topics
+            .get(original_id)
+            .unwrap();
+        assert_eq!(original_topic.id, original_id);
         let captured = super::TopicDurability {
             stream_id,
             topic_id: original_id,
-            created_revision: original_revision,
+            created_revision: original_topic.partitions[0].created_revision,
             durability: Durability::Persisted,
         };
 
+        // The original topic keeps its incarnation while the replacement takes
+        // the name still carried by the request.
         for (topic_id, new_name) in [(original_id, "archived"), (replacement_id, "orders")] {
             let result = UpdateTopicRequest {
                 stream_id: WireIdentifier::Numeric(stream_id.try_into().unwrap()),
@@ -555,6 +580,7 @@ mod tests {
             assert_eq!(result.code, 0);
         }
 
+        // Resolve after the modeled wait; this does not execute an HTTP dispatch.
         let dispatched_id =
             crate::responses::resolve_topic_id(&inner, stream_id, &requested_topic).unwrap();
         assert_eq!(dispatched_id, replacement_id);
@@ -565,6 +591,7 @@ mod tests {
             .topics
             .get(dispatched_id)
             .unwrap();
+        assert_eq!(dispatched.id, dispatched_id);
         let actual_policy = dispatched.options.get(&super::DURABILITY_KEY).unwrap();
         assert_eq!(actual_policy.value.as_bytes(), b"replicated");
         assert_eq!(
