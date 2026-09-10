@@ -478,19 +478,101 @@ pub(in crate::http) fn topic_durability(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BarrierWait, FrontierWait, ReadError, barrier_state, hold_for_frontier,
-        read_needs_metadata_frontier,
-    };
-    use crate::http::state::MetadataWatermarks;
+    use std::future::pending;
+    use std::sync::Arc;
+
     use iggy_binary_protocol::codes::{
         DESCRIBE_OPTIONS_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
         GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
         GET_USER_CODE, GET_USERS_CODE,
     };
+    use iggy_binary_protocol::requests::topics::UpdateTopicRequest;
+    use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions};
+    use iggy_common::wire_conversions::resource_options_from_wire;
+    use iggy_common::{Durability, IggyTimestamp, TopicCreateOptions};
     use metadata::AppliedFrontier;
-    use std::future::pending;
-    use std::sync::Arc;
+    use metadata::stm::StateHandler;
+
+    use crate::http::state::MetadataWatermarks;
+
+    use super::{
+        BarrierWait, FrontierWait, ReadError, barrier_state, hold_for_frontier,
+        read_needs_metadata_frontier,
+    };
+
+    #[test]
+    fn named_produce_attests_the_dispatched_topic() {
+        let mut inner = metadata::stm::stream::StreamsInner::default();
+        let mut stream = metadata::stm::stream::Stream::default();
+        let [(original_id, original_revision), (replacement_id, _)] = [
+            ("orders", Durability::Persisted, 3),
+            ("fast", Durability::Replicated, 4),
+        ]
+        .map(|(name, policy, revision)| {
+            let options = TopicCreateOptions {
+                durability: policy,
+                ..Default::default()
+            }
+            .to_wire()
+            .unwrap();
+            let topic = metadata::stm::stream::Topic {
+                name: name.into(),
+                options: resource_options_from_wire(&options, true).unwrap(),
+                partitions: vec![metadata::stm::stream::Partition::new(
+                    0,
+                    1,
+                    IggyTimestamp::default(),
+                    revision,
+                    0,
+                )],
+                ..Default::default()
+            };
+            let topic_id = stream.topics.insert(topic);
+            stream.topic_index.insert(name.into(), topic_id);
+            (topic_id, revision)
+        });
+        let stream_id = inner.items.insert(stream);
+        let requested_topic = WireIdentifier::String(WireName::new("orders").unwrap());
+        assert_eq!(
+            crate::responses::resolve_topic_id(&inner, stream_id, &requested_topic).unwrap(),
+            original_id
+        );
+        let captured = super::TopicDurability {
+            stream_id,
+            topic_id: original_id,
+            created_revision: original_revision,
+            durability: Durability::Persisted,
+        };
+
+        for (topic_id, new_name) in [(original_id, "archived"), (replacement_id, "orders")] {
+            let result = UpdateTopicRequest {
+                stream_id: WireIdentifier::Numeric(stream_id.try_into().unwrap()),
+                topic_id: WireIdentifier::Numeric(topic_id.try_into().unwrap()),
+                name: WireName::new(new_name).unwrap(),
+                options: WireOptions::empty(),
+            }
+            .apply(&mut inner, IggyTimestamp::default());
+            assert_eq!(result.code, 0);
+        }
+
+        let dispatched_id =
+            crate::responses::resolve_topic_id(&inner, stream_id, &requested_topic).unwrap();
+        assert_eq!(dispatched_id, replacement_id);
+        let dispatched = inner
+            .items
+            .get(stream_id)
+            .unwrap()
+            .topics
+            .get(dispatched_id)
+            .unwrap();
+        let actual_policy = dispatched.options.get(&super::DURABILITY_KEY).unwrap();
+        assert_eq!(actual_policy.value.as_bytes(), b"replicated");
+        assert_eq!(
+            captured.confirmed_policy_in(&inner),
+            Durability::Replicated,
+            "the original topic survived its rename, but the named request now routes to a different topic"
+        );
+    }
 
     #[test]
     fn completed_produce_checks_the_stored_topic_incarnation() {
