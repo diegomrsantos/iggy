@@ -7595,7 +7595,12 @@ where
                 if partition.queued_requests_ready() {
                     if walks < PARTITION_WALKS_PER_TICK_MAX {
                         walks += 1;
-                        partition.resume_queued_requests().await;
+                        if let Err(fault) = partition.resume_queued_requests().await {
+                            if fatal.is_none() {
+                                fatal = Some(fault);
+                            }
+                            continue;
+                        }
                     } else {
                         walk_cursor.get_or_insert(namespace);
                     }
@@ -7603,7 +7608,14 @@ where
                 if partition.needs_persistence_checkpoint() {
                     if walks < PARTITION_WALKS_PER_TICK_MAX {
                         walks += 1;
-                        partition.checkpoint_persistence(partitions.config()).await;
+                        if let Err(fault) =
+                            partition.checkpoint_persistence(partitions.config()).await
+                        {
+                            if fatal.is_none() {
+                                fatal = Some(fault);
+                            }
+                            continue;
+                        }
                     } else {
                         walk_cursor.get_or_insert(namespace);
                     }

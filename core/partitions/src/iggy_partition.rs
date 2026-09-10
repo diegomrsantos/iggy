@@ -946,35 +946,45 @@ where
         })
     }
 
-    pub async fn checkpoint_persistence(&mut self, config: &PartitionsConfig) {
+    /// Prepare and schedule a checkpoint without waiting for its completion.
+    ///
+    /// # Errors
+    /// Returns the fatal fault if the partition is fenced or preparation fails.
+    pub async fn checkpoint_persistence(
+        &mut self,
+        config: &PartitionsConfig,
+    ) -> Result<(), FatalCommit> {
+        self.ensure_not_fenced()?;
         let Some(persistence) = self
             .persistence
             .as_ref()
             .filter(|persistence| persistence.needs_checkpoint())
             .cloned()
         else {
-            return;
+            return Ok(());
         };
         let through_op = self.consensus.commit_min().min(persistence.head());
         if through_op <= persistence.checkpoint_op() {
-            return;
+            return Ok(());
         }
         match self.commit_messages_inner(config, true, through_op).await {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => return Ok(()),
             Err(error) => {
                 error!(%error, namespace_raw = self.namespace().inner(), "partition checkpoint failed");
-                self.fatal = Some(FatalCommit {
+                let fault = FatalCommit {
                     namespace_raw: self.namespace().inner(),
                     op: through_op,
                     operation: Operation::SendMessages,
-                });
-                return;
+                };
+                self.fatal = Some(fault.clone());
+                return Err(fault);
             }
         }
         let (files, directories) = self.persistence_checkpoint_files(config);
         persistence.checkpoint_files(through_op, files, directories);
         self.start_persistence();
+        Ok(())
     }
 
     fn persistence_checkpoint_files(
@@ -1066,6 +1076,9 @@ where
     }
 
     pub async fn drive_persistence(&mut self) {
+        if self.fatal.is_some() {
+            return;
+        }
         let Some(persistence) = self.persistence.as_ref() else {
             return;
         };
@@ -4343,7 +4356,7 @@ where
         // commit turn. Consecutive denials end the drain. The shard tick
         // resumes parked work even if no further operation commits.
         let mut consecutive_denials = 0usize;
-        while promoted < slots_freed {
+        while promoted < slots_freed && self.fatal.is_none() {
             let req = self.consensus().pop_queued_request();
             let Some(mut req) = req else { break };
             let parsed_store = (req.message.header().operation == Operation::StoreConsumerOffset)
@@ -4472,10 +4485,15 @@ where
     }
 
     /// Resume a bounded promotion turn without waiting for another commit.
-    pub async fn resume_queued_requests(&mut self) {
+    ///
+    /// # Errors
+    /// Returns the fatal fault if the partition is fenced before or during promotion.
+    pub async fn resume_queued_requests(&mut self) -> Result<(), FatalCommit> {
+        self.ensure_not_fenced()?;
         if self.queued_requests_ready() {
             self.drain_request_queue_into_prepares(1).await;
         }
+        self.ensure_not_fenced()
     }
 
     /// # Panics
@@ -8026,8 +8044,12 @@ where
         Ok(Some(base_offset))
     }
 
+    fn ensure_not_fenced(&self) -> Result<(), FatalCommit> {
+        self.fatal.clone().map_or(Ok(()), Err)
+    }
+
     async fn send_prepare_ok(&self, header: &PrepareHeader) -> bool {
-        if self.materialization_missing {
+        if self.fatal.is_some() || self.materialization_missing {
             return false;
         }
         // Durable-before-send: a PrepareOk implies this replica's
@@ -8909,7 +8931,7 @@ mod tests {
         assert_eq!(batch.message_count(), 1);
         assert_eq!(batch.iter().next().unwrap().payload, b"replacement");
         persistence.request_checkpoint();
-        partition.checkpoint_persistence(&config).await;
+        partition.checkpoint_persistence(&config).await.unwrap();
         persistence.drain_with_timeout().await.unwrap();
         assert!(persistence.failure().is_none());
         assert_eq!(persistence.checkpoint_op(), 2);
@@ -9336,6 +9358,116 @@ mod tests {
             sent.borrow().is_empty(),
             "a fenced backup must not send a parked PrepareOk"
         );
+    }
+
+    #[compio::test]
+    async fn prepare_ack_paths_respect_the_partition_fence() {
+        for replica in [0, 1] {
+            for completion_driven in [false, true] {
+                for fenced in [false, true] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let (mut partition, _) = recording_partition_at(replica, 3);
+                    let sent = partition.consensus().message_bus().sent_to_replicas.clone();
+                    partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+                    partition.runtime_options.durability = iggy_common::Durability::Persisted;
+                    partition.open_persistence().await.unwrap();
+                    let completions = Rc::new(RefCell::new(Vec::new()));
+                    let captured = Rc::clone(&completions);
+                    partition.set_persistence_notifier(Rc::new(move |completion| {
+                        captured.borrow_mut().push(completion);
+                    }));
+                    let prepare = checksummed_segment_prepare(1, 0, 0, b"parked");
+                    let header = *prepare.header();
+                    partition.consensus().sequencer().set_sequence(header.op);
+                    partition
+                        .consensus()
+                        .set_last_prepare_checksum(header.checksum);
+                    partition
+                        .log
+                        .journal()
+                        .inner
+                        .append(prepare.clone().into_frozen())
+                        .await
+                        .unwrap();
+                    let persistence = partition.persistence.as_ref().unwrap();
+                    persistence.append(prepare.into_frozen(), true).unwrap();
+                    assert!(!partition.register_rebuilt_ack(&header));
+                    partition.start_persistence();
+                    persistence.drain_with_timeout().await.unwrap();
+                    assert!(persistence.is_durable(&header));
+                    assert!(persistence.failure().is_none());
+                    let completion = *completions.borrow().last().unwrap();
+                    assert!(persistence.accepts_completion(completion));
+                    let mut loopback = Vec::new();
+                    partition.consensus().drain_loopback_into(&mut loopback);
+                    assert!(loopback.is_empty());
+                    assert!(sent.borrow().is_empty());
+
+                    if fenced {
+                        partition.fence_flush_failure();
+                    }
+                    if completion_driven {
+                        partition.on_persistence_completed(completion).await;
+                    } else {
+                        partition.acknowledge_prepare(header.op).await;
+                    }
+
+                    partition.consensus().drain_loopback_into(&mut loopback);
+                    let sent = sent.borrow();
+                    let acknowledgments: Vec<_> = loopback
+                        .iter()
+                        .map(Message::as_slice)
+                        .chain(sent.iter().map(|(_, frame)| frame.as_slice()))
+                        .map(|frame| *bytemuck::checked::from_bytes::<PrepareOkHeader>(frame))
+                        .collect();
+                    assert_eq!(
+                        acknowledgments.len(),
+                        usize::from(!fenced),
+                        "replica={replica}, completion_driven={completion_driven}, fenced={fenced}"
+                    );
+                    for acknowledgment in acknowledgments {
+                        assert_eq!(acknowledgment.command, Command::PrepareOk);
+                        assert_eq!(acknowledgment.op, header.op);
+                        assert_eq!(acknowledgment.prepare_checksum, header.checksum);
+                    }
+                }
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn fenced_partition_rejects_work_and_preserves_queued_requests() {
+        let (mut partition, _) = recording_partition_at(0, 3);
+        for request in 1..=2 {
+            partition
+                .consensus()
+                .push_queued_request(consensus::RequestEntry::with_sender(
+                    store_offset_request(
+                        42,
+                        request,
+                        ConsumerKind::Consumer,
+                        7,
+                        0,
+                        AckLevel::Quorum,
+                    ),
+                    None,
+                ))
+                .unwrap();
+        }
+        partition.fence_flush_failure();
+        let expected = partition.fatal().unwrap().clone();
+        partition.drain_request_queue_into_prepares(2).await;
+        for result in [
+            partition.resume_queued_requests().await,
+            partition.checkpoint_persistence(&repair_config()).await,
+        ] {
+            let fault = result.unwrap_err();
+            assert_eq!(fault.namespace_raw, expected.namespace_raw);
+            assert_eq!(fault.op, expected.op);
+            assert_eq!(fault.operation, expected.operation);
+        }
+        assert_eq!(partition.consensus().request_queue_len(), 2);
+        assert_eq!(partition.consensus().pipeline_len(), 0);
     }
 
     #[compio::test]
@@ -11348,7 +11480,7 @@ mod tests {
         assert_eq!(partition.consensus.request_queue_len(), 2);
         assert_eq!(partition.consensus.pipeline_len(), 0);
         assert!(partition.queued_requests_ready());
-        partition.resume_queued_requests().await;
+        partition.resume_queued_requests().await.unwrap();
         assert_eq!(partition.consensus.request_queue_len(), 0);
         assert_eq!(partition.consensus.pipeline_len(), 1);
         assert!(!partition.queued_requests_ready());
@@ -14492,6 +14624,58 @@ mod tests {
         assert_eq!(partition.consensus().commit_min(), 4);
         assert!(partition.fatal.is_none());
         assert_eq!(std::fs::read(&log_path).unwrap(), expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn checkpoint_write_failure_returns_the_fault_and_withholds_a_parked_ack() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) = recording_partition_at(1, 3);
+        let sent = partition.consensus().message_bus().sent_to_replicas.clone();
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        partition.open_persistence().await.unwrap();
+        let prepare = checksummed_segment_prepare(1, 0, 0, b"checkpoint");
+        let header = *prepare.header();
+        partition.consensus().sequencer().set_sequence(header.op);
+        partition
+            .consensus()
+            .set_last_prepare_checksum(header.checksum);
+        partition
+            .append_repaired_send_messages(prepare.clone())
+            .await
+            .unwrap();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        persistence.append(prepare.into_frozen(), true).unwrap();
+        assert!(!partition.register_rebuilt_ack(&header));
+        partition.start_persistence();
+        persistence.drain_with_timeout().await.unwrap();
+        assert!(persistence.is_durable(&header));
+        assert!(persistence.failure().is_none());
+        assert!(partition.fatal().is_none());
+        assert!(sent.borrow().is_empty());
+
+        let index_writer = IggyIndexWriter::new(DEV_FULL, Rc::new(AtomicU64::new(0)), true, false)
+            .await
+            .unwrap();
+        partition.log.index_writers_mut()[0] = Some(Rc::new(index_writer));
+        partition
+            .consensus()
+            .restore_commit_state(header.op, header.op);
+        persistence.request_checkpoint();
+        let fault = partition
+            .checkpoint_persistence(&repair_config())
+            .await
+            .unwrap_err();
+        assert_eq!(fault.namespace_raw, partition.namespace().inner());
+        assert_eq!(fault.op, header.op);
+        assert_eq!(fault.operation, Operation::SendMessages);
+        assert_eq!(partition.fatal().unwrap().op, fault.op);
+        assert!(persistence.failure().is_none());
+        assert_eq!(persistence.checkpoint_op(), 0);
+
+        partition.drive_persistence().await;
+        assert!(sent.borrow().is_empty());
     }
 
     #[cfg(target_os = "linux")]
