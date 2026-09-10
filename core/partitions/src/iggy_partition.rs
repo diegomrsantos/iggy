@@ -9299,6 +9299,46 @@ mod tests {
     }
 
     #[compio::test]
+    async fn fenced_backup_does_not_release_a_parked_durable_prepare_ack() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) = recording_partition_at(1, 3);
+        let sent = partition.consensus().message_bus().sent_to_replicas.clone();
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        partition.open_persistence().await.unwrap();
+        let prepare = checksummed_segment_prepare(1, 0, 0, b"parked");
+        let header = *prepare.header();
+        partition.consensus().sequencer().set_sequence(header.op);
+        partition
+            .consensus()
+            .set_last_prepare_checksum(header.checksum);
+        partition
+            .log
+            .journal()
+            .inner
+            .append(prepare.clone().into_frozen())
+            .await
+            .unwrap();
+        let persistence = partition.persistence.as_ref().unwrap();
+        persistence.append(prepare.into_frozen(), true).unwrap();
+        assert!(!partition.register_rebuilt_ack(&header));
+        partition.start_persistence();
+        persistence.drain_with_timeout().await.unwrap();
+        assert!(persistence.is_durable(&header));
+        assert!(persistence.failure().is_none());
+        assert!(sent.borrow().is_empty());
+
+        partition.fence_flush_failure();
+        assert!(partition.fatal().is_some());
+        partition.drive_persistence().await;
+
+        assert!(
+            sent.borrow().is_empty(),
+            "a fenced backup must not send a parked PrepareOk"
+        );
+    }
+
+    #[compio::test]
     async fn consumer_offset_open_failure_does_not_poison_the_wal_and_can_be_retried() {
         let directory = tempfile::tempdir().unwrap();
         let (mut partition, _) = recording_partition_at(0, 3);
